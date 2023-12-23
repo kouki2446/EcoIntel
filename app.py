@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
+from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, request
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -8,7 +8,8 @@ import cv2
 from datetime import datetime
 import os
 from flask_mail import Mail, Message
-
+import requests
+import pandas as pd
 
 
 # アプリケーションの設定
@@ -39,8 +40,9 @@ class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
     email = db.Column(db.String(100), unique=True, nullable=False)
-    country = db.Column(db.String(100))  # 国
-    city = db.Column(db.String(100))     # 都市
+    postcode = db.Column(db.String(100))  
+    address = db.Column(db.String(100))  
+    school_district = db.Column(db.String(100)) 
     birth_date = db.Column(db.Date)      # 生年月日
     password_hash = db.Column(db.String(128))
 
@@ -54,8 +56,10 @@ class User(UserMixin, db.Model):
 
 # モデルの読み込みとデータの準備
 model = load_model("keras_Model.h5", compile=False)
-with open('labels.txt', 'r', encoding="utf-8") as file:
-    class_names = [line.strip() for line in file.readlines()]
+# CSVファイルから特定の列を読み込む
+data = pd.read_csv("data.csv", header=None)
+selected_columns = [4, 6, 8, 10, 12, 14, 16, 18]
+class_names = data.iloc[0, selected_columns].tolist()
 with open('explanation.txt', 'r', encoding="utf-8") as file:
     explanations = [line.strip() for line in file.readlines()]
 
@@ -101,12 +105,13 @@ def register():
         email = request.form.get('email')
         password = request.form.get('password')
         password2 = request.form.get('password2')
-        country = request.form.get('country')
-        city = request.form.get('city')
+        postcode = request.form.get('postcode')
+        address = request.form.get('address')
+        school_district = request.form.get('school_district')
         birth_date_str = request.form.get('birth_date')
 
         # データのバリデーション
-        if not all([name, email, password, password2, country, city, birth_date_str]):
+        if not all([name, email, password, password2, postcode, address,school_district, birth_date_str]):
             flash('All fields are required.')
             return redirect(url_for('register'))
 
@@ -131,8 +136,9 @@ def register():
         new_user = User(
             name=name,
             email=email,
-            country=country,
-            city=city,
+            postcode=postcode,
+            address=address,
+            school_district=school_district,
             birth_date=birth_date
         )
         new_user.set_password(password)
@@ -172,6 +178,19 @@ def mypage():
     db.session.refresh(user)
     return render_template('mypage.html', user=user)
 
+@app.route('/delete_account', methods=['POST'])
+def delete_account():
+    if current_user.is_authenticated:
+        user_to_delete = User.query.get(current_user.id)
+        if user_to_delete:
+            db.session.delete(user_to_delete)
+            db.session.commit()
+            logout_user()
+            flash('Your account has been successfully deleted.')
+        else:
+            flash('An error occurred. Please try again.')
+    return redirect(url_for('home'))
+
 @app.route('/settings')
 def settings():
     return render_template('settings.html', user=current_user)
@@ -181,17 +200,6 @@ def settings():
 @login_required
 def update_settings():
     user = current_user
-
-    # ユーザー名の更新
-    username = request.form.get('username').strip()
-    if username and username != user.username:
-        existing_user = User.query.filter_by(username=username).first()
-        if existing_user:
-            flash('このユーザー名はすでに使われています。')
-            return redirect(url_for('settings'))
-        else:
-            user.username = username
-
     # メールアドレスの更新
     email = request.form.get('email').strip()
     if email and email != user.email:
@@ -243,7 +251,6 @@ def submit_contact():
     return 'メッセージを送信しました。'
 
 
-
 @app.route('/predict', methods=['POST'])
 def predict():
     if 'image' not in request.files:
@@ -251,7 +258,7 @@ def predict():
 
     file = request.files['image']
     
-    # 画像形式のチェック (例: JPEG, PNG)
+    # 画像形式のチェック
     if not file.content_type in ['image/jpeg', 'image/png']:
         return jsonify({'error': 'サポートされていないファイル形式です。画像ファイル（JPEG、PNG）を選択してください。'}), 400
 
@@ -262,13 +269,13 @@ def predict():
     if image is None:
         return jsonify({'error': '画像の読み込みに失敗しました。'}), 400
 
-    # Process the image
+    # 画像の処理
     try:
         image = cv2.resize(image, (224, 224), interpolation=cv2.INTER_AREA)
         image = np.asarray(image, dtype=np.float32).reshape(1, 224, 224, 3)
         image = (image / 127.5) - 1
 
-        # Predict
+        # 予測
         prediction = model.predict(image)
     except Exception as e:
         return jsonify({'error': '予測処理中にエラーが発生しました。'}), 500
@@ -276,13 +283,92 @@ def predict():
     index = np.argmax(prediction)
     class_name = class_names[index].strip()
     confidence_score = prediction[0][index]
-    explanation = explanations[index] # 予測されたクラスに対応する説明を取得
+    explanation = explanations[index]
+
+    # ログインしている場合のみURLを取得
+    how_url = None
+    day_url = None
+    if current_user.is_authenticated:
+        # ユーザーのschool_districtを取得
+        user_school_district = current_user.school_district
+
+        # CSVファイルからデータを取得
+        data = pd.read_csv("data.csv", header=None)
+        matching_rows = data[data[2] == user_school_district]
+
+        # 該当する行がある場合のみURLを取得
+        if not matching_rows.empty:
+            row = matching_rows.iloc[0]
+            url_columns = [5, 7, 9, 11, 13, 15, 17, 19]
+            class_urls = row[url_columns].tolist()
+            how_url = class_urls[index]
+            day_url = row[3]  # ゴミの処理日のURL
 
     return jsonify({
         'class': class_name,
         'confidence_score': str(np.round(confidence_score * 100))[:-2],
-        'explanation': explanation
+        'explanation': explanation,
+        'how_url': how_url,  # URLをJSONレスポンスに含める
+        'day_url': day_url
     })
+
+@app.route('/check_login_status')
+def check_login_status():
+    if current_user.is_authenticated:
+        return jsonify({'is_logged_in': True})
+    else:
+        return jsonify({'is_logged_in': False})
+
+
+
+# 町と校区のデータを取得
+towns = data.iloc[:, 1]  # 町のデータは2列目
+schools = data.iloc[:, 2]  # 校区のデータは3列目
+
+# 町と校区のマッピングを作成
+town_to_school_mapping = {}
+for town, school in zip(towns, schools):
+    if town in town_to_school_mapping:
+        # 町がすでにキーとして存在する場合は校区を追加
+        if school not in town_to_school_mapping[town]:
+            town_to_school_mapping[town].append(school)
+    else:
+        # 町がキーとして存在しない場合は新しいエントリを作成
+        town_to_school_mapping[town] = [school]
+
+
+
+@app.route('/get_address', methods=['GET'])
+def get_address():
+    zipcode = request.args.get('zipcode')
+    if not zipcode:
+        return jsonify({"error": "No zipcode provided"}), 400
+
+    url = 'https://zipcloud.ibsnet.co.jp/api/search'
+    response = requests.get(url, params={'zipcode': zipcode})
+    data = response.json()
+
+    if 'results' in data and data['results']:
+        # 住所を取得（エラーチェックが必要）
+        address1 = data["results"][0]["address1"]
+        address2 = data["results"][0]["address2"]
+        address3 = data["results"][0]["address3"]
+        full_address = address1 + address2 + address3
+        town_name = address3
+        return jsonify({"address": full_address, "town_name": town_name})
+    else:
+        # エラーレスポンスを返す
+        return jsonify({"error": "No address found for the provided zipcode"}), 404
+
+
+@app.route('/get_school_districts', methods=['GET'])
+def get_school_districts():
+    town_name = request.args.get('town')
+    school_districts = town_to_school_mapping.get(town_name, ["不明"])
+    return jsonify({"school_districts": school_districts})
+
+
+
 
 # メイン関数
 if __name__ == '__main__':
